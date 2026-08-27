@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.16)
+
+project(
+    CustomMemoryAllocator
+    VERSION 1.0.0
+    LANGUAGES CXX
+)
+
+include(GNUInstallDirs)
+find_package(Threads REQUIRED)
+
+if(PROJECT_IS_TOP_LEVEL)
+    include(CTest)
+endif()
+
+add_library(custom_memory_allocator src/MemoryPool.cpp)
+add_library(CustomMemoryAllocator::core ALIAS custom_memory_allocator)
+set_target_properties(custom_memory_allocator PROPERTIES EXPORT_NAME core)
+
+add_library(custom_memory_allocator_global_new src/GlobalNew.cpp)
+add_library(
+    CustomMemoryAllocator::global_new
+    ALIAS custom_memory_allocator_global_new
+)
+set_target_properties(
+    custom_memory_allocator_global_new
+    PROPERTIES EXPORT_NAME global_new
+)
+
+target_compile_features(custom_memory_allocator PUBLIC cxx_std_17)
+target_link_libraries(custom_memory_allocator PUBLIC Threads::Threads)
+target_include_directories(
+    custom_memory_allocator
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+target_compile_features(custom_memory_allocator_global_new PUBLIC cxx_std_17)
+target_include_directories(
+    custom_memory_allocator_global_new
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+target_link_libraries(
+    custom_memory_allocator_global_new
+    PUBLIC CustomMemoryAllocator::core
+)
+
+if(BUILD_TESTING AND PROJECT_IS_TOP_LEVEL)
+    add_subdirectory(test)
+endif()
+
+install(
+    TARGETS custom_memory_allocator custom_memory_allocator_global_new
+    EXPORT CustomMemoryAllocatorTargets
+    INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(
+    EXPORT CustomMemoryAllocatorTargets
+    FILE CustomMemoryAllocatorTargets.cmake
+    NAMESPACE CustomMemoryAllocator::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/CustomMemoryAllocator
+)
