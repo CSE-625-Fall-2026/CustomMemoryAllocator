@@ -121,6 +121,7 @@ private:
     void insertFreeBlock(detail::BlockHeader* block) noexcept;
     void removeFreeBlock(detail::BlockHeader* block) noexcept;
     detail::BlockHeader* coalesce(detail::BlockHeader* block) noexcept;
+    void coalesceFreeBlocksUnlocked() noexcept;
     void updateFollowingBlock(detail::BlockHeader* block) noexcept;
     void report(MemoryError error, const void* pointer) const noexcept;
 

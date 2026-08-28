@@ -14,6 +14,7 @@ namespace {
 constexpr std::uint64_t live_block_magic = 0x434D414C4C4F4341ULL;
 constexpr std::uint64_t free_block_magic = 0x46524545424C4F43ULL;
 constexpr std::uint64_t cached_block_magic = 0x434143484544424CULL;
+constexpr std::uint64_t reserved_block_magic = 0x5245534552564544ULL;
 constexpr std::uint64_t retired_block_magic = 0x5245544952454442ULL;
 
 bool isPowerOfTwo(std::size_t value) noexcept {
@@ -507,6 +508,10 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
             best = findBestFit(bytes, alignment);
         }
         if (best == nullptr) {
+            coalesceFreeBlocksUnlocked();
+            best = findBestFit(bytes, alignment);
+        }
+        if (best == nullptr) {
             throw std::bad_alloc{};
         }
 
@@ -525,6 +530,7 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
             updateFollowingBlock(remainder);
             insertFreeBlock(remainder);
         }
+        best->magic = reserved_block_magic;
     }
     return activateBlock(best, bytes, alignment);
 }
@@ -626,7 +632,7 @@ void MemoryPool::deallocate(void* pointer) noexcept {
 
     std::lock_guard<std::mutex> lock(mutex_);
     block->magic = free_block_magic;
-    coalesce(block);
+    insertFreeBlock(block);
 }
 
 void MemoryPool::flushCacheBinUnlocked(
@@ -646,7 +652,7 @@ void MemoryPool::flushCacheBinUnlocked(
         --count;
 
         block->magic = free_block_magic;
-        coalesce(block);
+        insertFreeBlock(block);
     }
 }
 
@@ -781,6 +787,27 @@ detail::BlockHeader* MemoryPool::coalesce(
     updateFollowingBlock(block);
     insertFreeBlock(block);
     return block;
+}
+
+void MemoryPool::coalesceFreeBlocksUnlocked() noexcept {
+    if (region_ == nullptr) {
+        return;
+    }
+
+    auto* block = static_cast<detail::BlockHeader*>(region_);
+    while (detail::BlockHeader* next = nextPhysicalBlock(block)) {
+        if (block->magic == free_block_magic &&
+            next->magic == free_block_magic) {
+            removeFreeBlock(block);
+            removeFreeBlock(next);
+            block->total_size += next->total_size;
+            next->magic = retired_block_magic;
+            updateFollowingBlock(block);
+            insertFreeBlock(block);
+            continue;
+        }
+        block = next;
+    }
 }
 
 void MemoryPool::report(MemoryError error, const void* pointer) const noexcept {
