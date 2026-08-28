@@ -46,6 +46,7 @@ namespace detail {
 
 struct alignas(std::max_align_t) BlockHeader {
     std::size_t total_size{0};
+    std::size_t previous_size{0};
     std::size_t requested_size{0};
     void* user_pointer{nullptr};
     BlockHeader* previous_free{nullptr};
@@ -153,10 +154,16 @@ bool MemoryPool::initialize(std::size_t bytes) noexcept {
 
     region_ = region;
     region_size_ = mapped_size;
-    free_head_ = ::new (region_) detail::BlockHeader{};
-    free_head_->total_size = mapped_size;
+    free_bins_.fill(nullptr);
+    occupied_bins_ = 0;
+    auto* initial_block = ::new (region_) detail::BlockHeader{};
+    initial_block->total_size = mapped_size;
+    insertFreeBlock(initial_block);
     statistics_ = {};
     statistics_.capacity_bytes = mapped_size;
+    const auto begin = reinterpret_cast<std::uintptr_t>(region_);
+    region_begin_.store(begin, std::memory_order_release);
+    region_end_.store(begin + mapped_size, std::memory_order_release);
     return true;
 }
 
@@ -166,25 +173,38 @@ bool MemoryPool::shutdown() noexcept {
         return false;
     }
 
-    if (::munmap(region_, region_size_) != 0) {
+    void* region = region_;
+    const std::size_t region_size = region_size_;
+    region_begin_.store(0, std::memory_order_release);
+    region_end_.store(0, std::memory_order_release);
+
+    if (::munmap(region, region_size) != 0) {
+        const auto begin = reinterpret_cast<std::uintptr_t>(region);
+        region_begin_.store(begin, std::memory_order_release);
+        region_end_.store(begin + region_size, std::memory_order_release);
         return false;
     }
 
     region_ = nullptr;
     region_size_ = 0;
-    free_head_ = nullptr;
+    free_bins_.fill(nullptr);
+    occupied_bins_ = 0;
     statistics_ = {};
     return true;
 }
 
 bool MemoryPool::isInitialized() const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return region_ != nullptr;
+    return region_begin_.load(std::memory_order_acquire) != 0;
 }
 
 bool MemoryPool::owns(const void* pointer) const noexcept {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return ownsUnlocked(pointer);
+    if (pointer == nullptr) {
+        return false;
+    }
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    const auto begin = region_begin_.load(std::memory_order_acquire);
+    const auto end = region_end_.load(std::memory_order_acquire);
+    return begin != 0 && address >= begin && address < end;
 }
 
 bool MemoryPool::ownsUnlocked(const void* pointer) const noexcept {
@@ -201,6 +221,51 @@ Statistics MemoryPool::statistics() const noexcept {
     return statistics_;
 }
 
+std::size_t MemoryPool::binIndex(std::size_t block_size) noexcept {
+    std::size_t index = 0;
+    while (block_size > 1 && index + 1 < free_bin_count) {
+        block_size >>= 1;
+        ++index;
+    }
+    return index;
+}
+
+detail::BlockHeader* MemoryPool::findBestFit(
+    std::size_t bytes,
+    std::size_t alignment
+) const noexcept {
+    if (bytes > std::numeric_limits<std::size_t>::max() -
+            sizeof(detail::BlockHeader) - sizeof(detail::BlockHeader*) -
+            2 * sizeof(std::uint32_t)) {
+        return nullptr;
+    }
+
+    const std::size_t minimum_size = sizeof(detail::BlockHeader) +
+        sizeof(detail::BlockHeader*) + 2 * sizeof(std::uint32_t) + bytes;
+
+    for (std::size_t bin = binIndex(minimum_size);
+         bin < free_bin_count;
+         ++bin) {
+        const std::uint64_t bit = std::uint64_t{1} << bin;
+        if ((occupied_bins_ & bit) == 0) {
+            continue;
+        }
+
+        detail::BlockHeader* best = nullptr;
+        for (detail::BlockHeader* block = free_bins_[bin]; block != nullptr;
+             block = block->next_free) {
+            if (calculateLayout(block, bytes, alignment).user != nullptr &&
+                (best == nullptr || block->total_size < best->total_size)) {
+                best = block;
+            }
+        }
+        if (best != nullptr) {
+            return best;
+        }
+    }
+    return nullptr;
+}
+
 void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
     if (bytes == 0) {
         bytes = 1;
@@ -214,20 +279,11 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
         throw std::bad_alloc{};
     }
 
-    detail::BlockHeader* best = nullptr;
-    Layout best_layout{};
-    for (detail::BlockHeader* block = free_head_; block != nullptr;
-         block = block->next_free) {
-        const Layout layout = calculateLayout(block, bytes, alignment);
-        if (layout.user != nullptr &&
-            (best == nullptr || block->total_size < best->total_size)) {
-            best = block;
-            best_layout = layout;
-        }
-    }
+    detail::BlockHeader* best = findBestFit(bytes, alignment);
     if (best == nullptr) {
         throw std::bad_alloc{};
     }
+    const Layout best_layout = calculateLayout(best, bytes, alignment);
 
     removeFreeBlock(best);
     const std::size_t remainder_size = best->total_size - best_layout.used_size;
@@ -236,7 +292,9 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
             reinterpret_cast<std::byte*>(best) + best_layout.used_size;
         auto* remainder = ::new (remainder_address) detail::BlockHeader{};
         remainder->total_size = remainder_size;
+        remainder->previous_size = best_layout.used_size;
         best->total_size = best_layout.used_size;
+        updateFollowingBlock(remainder);
         insertFreeBlock(remainder);
     }
 
@@ -315,7 +373,6 @@ void MemoryPool::deallocate(void* pointer) noexcept {
     block->requested_size = 0;
     block->user_pointer = nullptr;
     block->magic = free_block_magic;
-    insertFreeBlock(block);
     coalesce(block);
 }
 
@@ -324,77 +381,83 @@ void MemoryPool::setErrorHandler(ErrorHandler handler) noexcept {
     error_handler_ = handler == nullptr ? defaultErrorHandler : handler;
 }
 
-void MemoryPool::insertFreeBlock(detail::BlockHeader* block) noexcept {
-    block->magic = free_block_magic;
-    block->previous_free = nullptr;
-    block->next_free = nullptr;
-
-    if (free_head_ == nullptr) {
-        free_head_ = block;
-        return;
+detail::BlockHeader* MemoryPool::previousPhysicalBlock(
+    detail::BlockHeader* block
+) const noexcept {
+    if (block->previous_size == 0) {
+        return nullptr;
     }
+    return reinterpret_cast<detail::BlockHeader*>(
+        reinterpret_cast<std::byte*>(block) - block->previous_size
+    );
+}
 
-    detail::BlockHeader* current = free_head_;
-    detail::BlockHeader* previous = nullptr;
-    const auto block_address = reinterpret_cast<std::uintptr_t>(block);
-    while (current != nullptr &&
-           reinterpret_cast<std::uintptr_t>(current) < block_address) {
-        previous = current;
-        current = current->next_free;
+detail::BlockHeader* MemoryPool::nextPhysicalBlock(
+    detail::BlockHeader* block
+) const noexcept {
+    auto* next_address =
+        reinterpret_cast<std::byte*>(block) + block->total_size;
+    auto* region_end = static_cast<std::byte*>(region_) + region_size_;
+    if (next_address >= region_end) {
+        return nullptr;
     }
+    return reinterpret_cast<detail::BlockHeader*>(next_address);
+}
 
-    block->previous_free = previous;
-    block->next_free = current;
-    if (previous != nullptr) {
-        previous->next_free = block;
-    } else {
-        free_head_ = block;
-    }
-    if (current != nullptr) {
-        current->previous_free = block;
+void MemoryPool::updateFollowingBlock(detail::BlockHeader* block) noexcept {
+    if (detail::BlockHeader* next = nextPhysicalBlock(block)) {
+        next->previous_size = block->total_size;
     }
 }
 
+void MemoryPool::insertFreeBlock(detail::BlockHeader* block) noexcept {
+    const std::size_t bin = binIndex(block->total_size);
+    block->magic = free_block_magic;
+    block->previous_free = nullptr;
+    block->next_free = free_bins_[bin];
+    if (block->next_free != nullptr) {
+        block->next_free->previous_free = block;
+    }
+    free_bins_[bin] = block;
+    occupied_bins_ |= std::uint64_t{1} << bin;
+}
+
 void MemoryPool::removeFreeBlock(detail::BlockHeader* block) noexcept {
+    const std::size_t bin = binIndex(block->total_size);
     if (block->previous_free != nullptr) {
         block->previous_free->next_free = block->next_free;
     } else {
-        free_head_ = block->next_free;
+        free_bins_[bin] = block->next_free;
     }
     if (block->next_free != nullptr) {
         block->next_free->previous_free = block->previous_free;
     }
     block->previous_free = nullptr;
     block->next_free = nullptr;
+    if (free_bins_[bin] == nullptr) {
+        occupied_bins_ &= ~(std::uint64_t{1} << bin);
+    }
 }
 
 detail::BlockHeader* MemoryPool::coalesce(
     detail::BlockHeader* block
 ) noexcept {
-    detail::BlockHeader* previous = block->previous_free;
-    if (previous != nullptr &&
-        reinterpret_cast<std::byte*>(previous) + previous->total_size ==
-            reinterpret_cast<std::byte*>(block)) {
+    detail::BlockHeader* previous = previousPhysicalBlock(block);
+    if (previous != nullptr && previous->magic == free_block_magic) {
+        removeFreeBlock(previous);
         previous->total_size += block->total_size;
-        previous->next_free = block->next_free;
-        if (block->next_free != nullptr) {
-            block->next_free->previous_free = previous;
-        }
         block->magic = retired_block_magic;
         block = previous;
     }
 
-    detail::BlockHeader* next = block->next_free;
-    if (next != nullptr &&
-        reinterpret_cast<std::byte*>(block) + block->total_size ==
-            reinterpret_cast<std::byte*>(next)) {
+    detail::BlockHeader* next = nextPhysicalBlock(block);
+    if (next != nullptr && next->magic == free_block_magic) {
+        removeFreeBlock(next);
         block->total_size += next->total_size;
-        block->next_free = next->next_free;
-        if (next->next_free != nullptr) {
-            next->next_free->previous_free = block;
-        }
         next->magic = retired_block_magic;
     }
+    updateFollowingBlock(block);
+    insertFreeBlock(block);
     return block;
 }
 

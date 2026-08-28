@@ -1,8 +1,11 @@
 #ifndef CUSTOM_MEMORY_ALLOCATOR_MEMORY_POOL_HPP
 #define CUSTOM_MEMORY_ALLOCATOR_MEMORY_POOL_HPP
 
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <mutex>
 
 namespace custom_memory {
@@ -55,6 +58,9 @@ public:
     void setErrorHandler(ErrorHandler handler) noexcept;
 
 private:
+    static constexpr std::size_t free_bin_count =
+        std::numeric_limits<std::size_t>::digits;
+
     MemoryPool() noexcept = default;
     ~MemoryPool() = default;
 
@@ -64,15 +70,30 @@ private:
     ) noexcept;
 
     [[nodiscard]] bool ownsUnlocked(const void* pointer) const noexcept;
+    [[nodiscard]] detail::BlockHeader* findBestFit(
+        std::size_t bytes,
+        std::size_t alignment
+    ) const noexcept;
+    [[nodiscard]] detail::BlockHeader* previousPhysicalBlock(
+        detail::BlockHeader* block
+    ) const noexcept;
+    [[nodiscard]] detail::BlockHeader* nextPhysicalBlock(
+        detail::BlockHeader* block
+    ) const noexcept;
+    static std::size_t binIndex(std::size_t block_size) noexcept;
     void insertFreeBlock(detail::BlockHeader* block) noexcept;
     void removeFreeBlock(detail::BlockHeader* block) noexcept;
     detail::BlockHeader* coalesce(detail::BlockHeader* block) noexcept;
+    void updateFollowingBlock(detail::BlockHeader* block) noexcept;
     void report(MemoryError error, const void* pointer) const noexcept;
 
     mutable std::mutex mutex_;
     void* region_{nullptr};
     std::size_t region_size_{0};
-    detail::BlockHeader* free_head_{nullptr};
+    std::atomic<std::uintptr_t> region_begin_{0};
+    std::atomic<std::uintptr_t> region_end_{0};
+    std::array<detail::BlockHeader*, free_bin_count> free_bins_{};
+    std::uint64_t occupied_bins_{0};
     Statistics statistics_{};
     ErrorHandler error_handler_{defaultErrorHandler};
 };
