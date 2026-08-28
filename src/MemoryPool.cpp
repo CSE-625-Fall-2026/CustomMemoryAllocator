@@ -219,10 +219,10 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
     for (detail::BlockHeader* block = free_head_; block != nullptr;
          block = block->next_free) {
         const Layout layout = calculateLayout(block, bytes, alignment);
-        if (layout.user != nullptr) {
+        if (layout.user != nullptr &&
+            (best == nullptr || block->total_size < best->total_size)) {
             best = block;
             best_layout = layout;
-            break;
         }
     }
     if (best == nullptr) {
