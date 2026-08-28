@@ -61,6 +61,8 @@ struct ThreadCache {
     MemoryPool* owner{nullptr};
     std::array<BlockHeader*, MemoryPool::small_bin_count> bins{};
     std::array<std::size_t, MemoryPool::small_bin_count> counts{};
+    std::array<std::size_t, MemoryPool::small_bin_count> targets{};
+    std::array<std::size_t, MemoryPool::small_bin_count> refill_events{};
     std::size_t cached_bytes{0};
 
     ~ThreadCache();
@@ -339,6 +341,8 @@ detail::ThreadCache* MemoryPool::registerThreadCache() noexcept {
     }
     cache.bins.fill(nullptr);
     cache.counts.fill(0);
+    cache.targets.fill(initial_cached_blocks_per_bin);
+    cache.refill_events.fill(0);
     cache.cached_bytes = 0;
     cache.owner = this;
     ++active_thread_caches_;
@@ -574,8 +578,17 @@ detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
     }
 
     const std::size_t bin = smallBinIndex(first->total_size);
-    const std::size_t room = cached_blocks_per_bin > cache.counts[bin]
-        ? cached_blocks_per_bin - cache.counts[bin]
+    ++cache.refill_events[bin];
+    if (cache.refill_events[bin] >= cache_growth_interval) {
+        cache.targets[bin] = std::min(
+            cache.targets[bin] * 2,
+            maximum_cached_blocks_per_bin
+        );
+        cache.refill_events[bin] = 0;
+    }
+
+    const std::size_t room = cache.targets[bin] > cache.counts[bin]
+        ? cache.targets[bin] - cache.counts[bin]
         : 0;
     const std::size_t byte_room =
         cache.cached_bytes < maximum_thread_cache_bytes
@@ -628,12 +641,12 @@ void MemoryPool::cacheBlock(
     const std::size_t bin = smallBinIndex(block->total_size);
     pushCachedBlock(cache, block);
 
-    if (cache.counts[bin] > cached_blocks_per_bin ||
+    if (cache.counts[bin] > cache.targets[bin] ||
         cache.cached_bytes > maximum_thread_cache_bytes) {
         // Keep the frequently used half and return the rest in one batch.
         const std::size_t retained = std::max(
             std::size_t{1},
-            cached_blocks_per_bin / 2
+            cache.targets[bin] / 2
         );
         const std::size_t flush_count = cache.counts[bin] > retained
             ? cache.counts[bin] - retained
