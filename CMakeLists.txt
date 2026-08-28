@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 
 project(
     CustomMemoryAllocator
-    VERSION 5.0.0
+    VERSION 6.0.0
     LANGUAGES CXX
 )
 

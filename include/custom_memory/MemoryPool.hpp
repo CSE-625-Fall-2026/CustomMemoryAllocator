@@ -66,7 +66,9 @@ private:
     static constexpr std::size_t large_bin_count =
         std::numeric_limits<std::size_t>::digits;
     static constexpr std::size_t cached_blocks_per_bin = 64;
+    static constexpr std::size_t cache_refill_batch = 32;
     static constexpr std::size_t cache_flush_batch = 32;
+    static constexpr std::size_t maximum_thread_cache_bytes = 4 * 1024 * 1024;
     static constexpr std::size_t large_allocation_threshold = 64 * 1024;
 
     friend struct detail::ThreadCache;
@@ -88,10 +90,8 @@ private:
     ) noexcept;
     [[nodiscard]] detail::BlockHeader* findBestFit(
         std::size_t bytes,
-        std::size_t alignment
-    ) const noexcept;
-    [[nodiscard]] detail::BlockHeader* previousPhysicalBlock(
-        detail::BlockHeader* block
+        std::size_t alignment,
+        std::size_t minimum_block_size = 0
     ) const noexcept;
     [[nodiscard]] detail::BlockHeader* nextPhysicalBlock(
         detail::BlockHeader* block
@@ -111,6 +111,22 @@ private:
         detail::ThreadCache& cache,
         detail::BlockHeader* block
     ) noexcept;
+    void pushCachedBlock(
+        detail::ThreadCache& cache,
+        detail::BlockHeader* block
+    ) noexcept;
+    [[nodiscard]] detail::BlockHeader* reserveFreeBlock(
+        detail::BlockHeader* block,
+        std::size_t bytes,
+        std::size_t alignment,
+        std::size_t preferred_size
+    ) noexcept;
+    [[nodiscard]] detail::BlockHeader* refillSmallCacheUnlocked(
+        detail::ThreadCache& cache,
+        detail::BlockHeader* first,
+        std::size_t bytes,
+        std::size_t alignment
+    ) noexcept;
     void flushCacheBinUnlocked(
         detail::ThreadCache& cache,
         std::size_t bin,
@@ -120,9 +136,7 @@ private:
     void releaseThreadCache(detail::ThreadCache& cache) noexcept;
     void insertFreeBlock(detail::BlockHeader* block) noexcept;
     void removeFreeBlock(detail::BlockHeader* block) noexcept;
-    detail::BlockHeader* coalesce(detail::BlockHeader* block) noexcept;
     void coalesceFreeBlocksUnlocked() noexcept;
-    void updateFollowingBlock(detail::BlockHeader* block) noexcept;
     void report(MemoryError error, const void* pointer) const noexcept;
 
     mutable std::mutex mutex_;

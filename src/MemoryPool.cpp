@@ -48,10 +48,7 @@ std::uint32_t loadCanary(const void* address) noexcept {
 namespace detail {
 
 struct alignas(std::max_align_t) BlockHeader {
-    // Physical-neighbor fields are atomic because adjacent blocks can be
-    // owned by different thread caches. Free-list links stay locally owned.
     std::size_t total_size{0};
-    std::atomic<std::size_t> previous_size{0};
     std::size_t requested_size{0};
     void* user_pointer{nullptr};
     BlockHeader* previous_free{nullptr};
@@ -64,6 +61,7 @@ struct ThreadCache {
     MemoryPool* owner{nullptr};
     std::array<BlockHeader*, MemoryPool::small_bin_count> bins{};
     std::array<std::size_t, MemoryPool::small_bin_count> counts{};
+    std::size_t cached_bytes{0};
 
     ~ThreadCache();
 };
@@ -341,6 +339,7 @@ detail::ThreadCache* MemoryPool::registerThreadCache() noexcept {
     }
     cache.bins.fill(nullptr);
     cache.counts.fill(0);
+    cache.cached_bytes = 0;
     cache.owner = this;
     ++active_thread_caches_;
     return &cache;
@@ -364,9 +363,9 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
         detail::BlockHeader* best = nullptr;
         for (detail::BlockHeader* block = cache.bins[bin]; block != nullptr;
              block = block->next_free) {
-            if (calculateLayout(block, bytes, alignment).user != nullptr &&
-                (best == nullptr || block->total_size < best->total_size)) {
+            if (calculateLayout(block, bytes, alignment).user != nullptr) {
                 best = block;
+                break;
             }
         }
         if (best == nullptr) {
@@ -384,6 +383,7 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
         best->previous_free = nullptr;
         best->next_free = nullptr;
         --cache.counts[bin];
+        cache.cached_bytes -= best->total_size;
         return best;
     }
     return nullptr;
@@ -391,12 +391,14 @@ detail::BlockHeader* MemoryPool::takeCachedBlock(
 
 detail::BlockHeader* MemoryPool::findBestFit(
     std::size_t bytes,
-    std::size_t alignment
+    std::size_t alignment,
+    std::size_t minimum_block_size
 ) const noexcept {
     std::size_t minimum_size = 0;
     if (!minimumBlockSize(bytes, minimum_size)) {
         return nullptr;
     }
+    minimum_size = std::max(minimum_size, minimum_block_size);
 
     if (minimum_size <= small_block_limit) {
         for (std::size_t bin = smallBinIndex(minimum_size);
@@ -408,18 +410,12 @@ detail::BlockHeader* MemoryPool::findBestFit(
                 continue;
             }
 
-            detail::BlockHeader* best = nullptr;
             for (detail::BlockHeader* block = small_bins_[bin];
                  block != nullptr;
                  block = block->next_free) {
-                if (calculateLayout(block, bytes, alignment).user != nullptr &&
-                    (best == nullptr ||
-                     block->total_size < best->total_size)) {
-                    best = block;
+                if (calculateLayout(block, bytes, alignment).user != nullptr) {
+                    return block;
                 }
-            }
-            if (best != nullptr) {
-                return best;
             }
         }
     }
@@ -508,6 +504,8 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
             best = findBestFit(bytes, alignment);
         }
         if (best == nullptr) {
+            // Free blocks normally remain separate. Pay for coalescing only
+            // when no individual block can satisfy this allocation.
             coalesceFreeBlocksUnlocked();
             best = findBestFit(bytes, alignment);
         }
@@ -516,26 +514,98 @@ void* MemoryPool::allocate(std::size_t bytes, std::size_t alignment) {
         }
 
         const Layout layout = calculateLayout(best, bytes, alignment);
-        removeFreeBlock(best);
-        const std::size_t remainder_size =
-            best->total_size - layout.used_size;
-        if (remainder_size >= minimum_remainder) {
-            auto* remainder_address =
-                reinterpret_cast<std::byte*>(best) + layout.used_size;
-            auto* remainder =
-                ::new (remainder_address) detail::BlockHeader{};
-            remainder->total_size = remainder_size;
-            remainder->previous_size = layout.used_size;
-            best->total_size = layout.used_size;
-            updateFollowingBlock(remainder);
-            insertFreeBlock(remainder);
+        if (layout.used_size <= small_block_limit &&
+            alignment <= alignof(std::max_align_t)) {
+            best = refillSmallCacheUnlocked(
+                *cache,
+                best,
+                bytes,
+                alignment
+            );
+        } else {
+            best = reserveFreeBlock(best, bytes, alignment, 0);
         }
-        best->magic = reserved_block_magic;
     }
     return activateBlock(best, bytes, alignment);
 }
 
-void MemoryPool::cacheBlock(
+detail::BlockHeader* MemoryPool::reserveFreeBlock(
+    detail::BlockHeader* block,
+    std::size_t bytes,
+    std::size_t alignment,
+    std::size_t preferred_size
+) noexcept {
+    const Layout layout = calculateLayout(block, bytes, alignment);
+    std::size_t reserved_size = std::max(layout.used_size, preferred_size);
+    if (reserved_size > block->total_size ||
+        block->total_size - reserved_size < minimum_remainder) {
+        reserved_size = block->total_size;
+    }
+
+    removeFreeBlock(block);
+    const std::size_t remainder_size = block->total_size - reserved_size;
+    if (remainder_size >= minimum_remainder) {
+        auto* remainder_address =
+            reinterpret_cast<std::byte*>(block) + reserved_size;
+        auto* remainder =
+            ::new (remainder_address) detail::BlockHeader{};
+        remainder->total_size = remainder_size;
+        block->total_size = reserved_size;
+        insertFreeBlock(remainder);
+    }
+    block->magic = reserved_block_magic;
+    return block;
+}
+
+detail::BlockHeader* MemoryPool::refillSmallCacheUnlocked(
+    detail::ThreadCache& cache,
+    detail::BlockHeader* first,
+    std::size_t bytes,
+    std::size_t alignment
+) noexcept {
+    const Layout layout = calculateLayout(first, bytes, alignment);
+    const std::size_t slab_size = static_cast<std::size_t>(alignUp(
+        layout.used_size,
+        small_bin_quantum
+    ));
+    first = reserveFreeBlock(first, bytes, alignment, slab_size);
+    if (first->total_size > small_block_limit) {
+        return first;
+    }
+
+    const std::size_t bin = smallBinIndex(first->total_size);
+    const std::size_t room = cached_blocks_per_bin > cache.counts[bin]
+        ? cached_blocks_per_bin - cache.counts[bin]
+        : 0;
+    const std::size_t byte_room =
+        cache.cached_bytes < maximum_thread_cache_bytes
+        ? (maximum_thread_cache_bytes - cache.cached_bytes) / slab_size
+        : 0;
+    const std::size_t refill_count = std::min(
+        std::min(room, byte_room),
+        cache_refill_batch
+    );
+    for (std::size_t index = 0; index < refill_count; ++index) {
+        detail::BlockHeader* block = findBestFit(
+            bytes,
+            alignment,
+            slab_size
+        );
+        if (block == nullptr) {
+            break;
+        }
+        block = reserveFreeBlock(block, bytes, alignment, slab_size);
+        if (block->total_size > small_block_limit) {
+            block->magic = free_block_magic;
+            insertFreeBlock(block);
+            break;
+        }
+        pushCachedBlock(cache, block);
+    }
+    return first;
+}
+
+void MemoryPool::pushCachedBlock(
     detail::ThreadCache& cache,
     detail::BlockHeader* block
 ) noexcept {
@@ -548,11 +618,45 @@ void MemoryPool::cacheBlock(
     }
     cache.bins[bin] = block;
     ++cache.counts[bin];
+    cache.cached_bytes += block->total_size;
+}
 
-    if (cache.counts[bin] > cached_blocks_per_bin) {
-        // Return several blocks per lock acquisition instead of just one.
+void MemoryPool::cacheBlock(
+    detail::ThreadCache& cache,
+    detail::BlockHeader* block
+) noexcept {
+    const std::size_t bin = smallBinIndex(block->total_size);
+    pushCachedBlock(cache, block);
+
+    if (cache.counts[bin] > cached_blocks_per_bin ||
+        cache.cached_bytes > maximum_thread_cache_bytes) {
+        // Keep the frequently used half and return the rest in one batch.
+        const std::size_t retained = std::max(
+            std::size_t{1},
+            cached_blocks_per_bin / 2
+        );
+        const std::size_t flush_count = cache.counts[bin] > retained
+            ? cache.counts[bin] - retained
+            : std::min(cache.counts[bin], cache_flush_batch);
         std::lock_guard<std::mutex> lock(mutex_);
-        flushCacheBinUnlocked(cache, bin, cache_flush_batch);
+        flushCacheBinUnlocked(cache, bin, flush_count);
+        for (std::size_t candidate = small_bin_count;
+             cache.cached_bytes > maximum_thread_cache_bytes &&
+                 candidate > 0;
+             --candidate) {
+            const std::size_t candidate_bin = candidate - 1;
+            while (cache.cached_bytes > maximum_thread_cache_bytes &&
+                   cache.counts[candidate_bin] > 0) {
+                flushCacheBinUnlocked(
+                    cache,
+                    candidate_bin,
+                    std::min(
+                        cache.counts[candidate_bin],
+                        cache_flush_batch
+                    )
+                );
+            }
+        }
     }
 }
 
@@ -649,6 +753,7 @@ void MemoryPool::flushCacheBinUnlocked(
         block->previous_free = nullptr;
         block->next_free = nullptr;
         --cache.counts[bin];
+        cache.cached_bytes -= block->total_size;
         --count;
 
         block->magic = free_block_magic;
@@ -681,17 +786,6 @@ void MemoryPool::setErrorHandler(ErrorHandler handler) noexcept {
     );
 }
 
-detail::BlockHeader* MemoryPool::previousPhysicalBlock(
-    detail::BlockHeader* block
-) const noexcept {
-    if (block->previous_size == 0) {
-        return nullptr;
-    }
-    return reinterpret_cast<detail::BlockHeader*>(
-        reinterpret_cast<std::byte*>(block) - block->previous_size
-    );
-}
-
 detail::BlockHeader* MemoryPool::nextPhysicalBlock(
     detail::BlockHeader* block
 ) const noexcept {
@@ -702,12 +796,6 @@ detail::BlockHeader* MemoryPool::nextPhysicalBlock(
         return nullptr;
     }
     return reinterpret_cast<detail::BlockHeader*>(next_address);
-}
-
-void MemoryPool::updateFollowingBlock(detail::BlockHeader* block) noexcept {
-    if (detail::BlockHeader* next = nextPhysicalBlock(block)) {
-        next->previous_size = block->total_size;
-    }
 }
 
 void MemoryPool::insertFreeBlock(detail::BlockHeader* block) noexcept {
@@ -767,28 +855,6 @@ void MemoryPool::removeFreeBlock(detail::BlockHeader* block) noexcept {
     }
 }
 
-detail::BlockHeader* MemoryPool::coalesce(
-    detail::BlockHeader* block
-) noexcept {
-    detail::BlockHeader* previous = previousPhysicalBlock(block);
-    if (previous != nullptr && previous->magic == free_block_magic) {
-        removeFreeBlock(previous);
-        previous->total_size += block->total_size;
-        block->magic = retired_block_magic;
-        block = previous;
-    }
-
-    detail::BlockHeader* next = nextPhysicalBlock(block);
-    if (next != nullptr && next->magic == free_block_magic) {
-        removeFreeBlock(next);
-        block->total_size += next->total_size;
-        next->magic = retired_block_magic;
-    }
-    updateFollowingBlock(block);
-    insertFreeBlock(block);
-    return block;
-}
-
 void MemoryPool::coalesceFreeBlocksUnlocked() noexcept {
     if (region_ == nullptr) {
         return;
@@ -802,7 +868,6 @@ void MemoryPool::coalesceFreeBlocksUnlocked() noexcept {
             removeFreeBlock(next);
             block->total_size += next->total_size;
             next->magic = retired_block_magic;
-            updateFollowingBlock(block);
             insertFreeBlock(block);
             continue;
         }
