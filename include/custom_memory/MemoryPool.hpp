@@ -33,6 +33,7 @@ struct Statistics {
 
 namespace detail {
 struct BlockHeader;
+struct ThreadCache;
 }
 
 class MemoryPool final {
@@ -58,8 +59,17 @@ public:
     void setErrorHandler(ErrorHandler handler) noexcept;
 
 private:
-    static constexpr std::size_t free_bin_count =
+    static constexpr std::size_t small_bin_quantum = 64;
+    static constexpr std::size_t small_bin_count = 128;
+    static constexpr std::size_t small_block_limit =
+        small_bin_quantum * small_bin_count;
+    static constexpr std::size_t large_bin_count =
         std::numeric_limits<std::size_t>::digits;
+    static constexpr std::size_t cached_blocks_per_bin = 64;
+    static constexpr std::size_t cache_flush_batch = 32;
+    static constexpr std::size_t large_allocation_threshold = 64 * 1024;
+
+    friend struct detail::ThreadCache;
 
     MemoryPool() noexcept = default;
     ~MemoryPool() = default;
@@ -70,6 +80,12 @@ private:
     ) noexcept;
 
     [[nodiscard]] bool ownsUnlocked(const void* pointer) const noexcept;
+    [[nodiscard]] detail::ThreadCache* registerThreadCache() noexcept;
+    [[nodiscard]] detail::BlockHeader* takeCachedBlock(
+        detail::ThreadCache& cache,
+        std::size_t bytes,
+        std::size_t alignment
+    ) noexcept;
     [[nodiscard]] detail::BlockHeader* findBestFit(
         std::size_t bytes,
         std::size_t alignment
@@ -80,7 +96,28 @@ private:
     [[nodiscard]] detail::BlockHeader* nextPhysicalBlock(
         detail::BlockHeader* block
     ) const noexcept;
-    static std::size_t binIndex(std::size_t block_size) noexcept;
+    static std::size_t smallBinIndex(std::size_t block_size) noexcept;
+    static std::size_t largeBinIndex(std::size_t block_size) noexcept;
+    [[nodiscard]] std::size_t effectiveAlignment(
+        std::size_t bytes,
+        std::size_t alignment
+    ) const noexcept;
+    void* activateBlock(
+        detail::BlockHeader* block,
+        std::size_t bytes,
+        std::size_t alignment
+    ) noexcept;
+    void cacheBlock(
+        detail::ThreadCache& cache,
+        detail::BlockHeader* block
+    ) noexcept;
+    void flushCacheBinUnlocked(
+        detail::ThreadCache& cache,
+        std::size_t bin,
+        std::size_t count
+    ) noexcept;
+    void flushThreadCacheUnlocked(detail::ThreadCache& cache) noexcept;
+    void releaseThreadCache(detail::ThreadCache& cache) noexcept;
     void insertFreeBlock(detail::BlockHeader* block) noexcept;
     void removeFreeBlock(detail::BlockHeader* block) noexcept;
     detail::BlockHeader* coalesce(detail::BlockHeader* block) noexcept;
@@ -90,12 +127,20 @@ private:
     mutable std::mutex mutex_;
     void* region_{nullptr};
     std::size_t region_size_{0};
+    std::size_t page_size_{0};
+    std::size_t active_thread_caches_{0};
     std::atomic<std::uintptr_t> region_begin_{0};
     std::atomic<std::uintptr_t> region_end_{0};
-    std::array<detail::BlockHeader*, free_bin_count> free_bins_{};
-    std::uint64_t occupied_bins_{0};
-    Statistics statistics_{};
-    ErrorHandler error_handler_{defaultErrorHandler};
+    std::array<detail::BlockHeader*, small_bin_count> small_bins_{};
+    std::array<std::uint64_t, small_bin_count / 64> occupied_small_bins_{};
+    std::array<detail::BlockHeader*, large_bin_count> large_bins_{};
+    std::uint64_t occupied_large_bins_{0};
+    std::atomic<std::size_t> capacity_bytes_{0};
+    std::atomic<std::size_t> allocated_bytes_{0};
+    std::atomic<std::size_t> live_allocations_{0};
+    std::atomic<std::size_t> total_allocations_{0};
+    std::atomic<std::size_t> total_deallocations_{0};
+    std::atomic<ErrorHandler> error_handler_{defaultErrorHandler};
 };
 
 }
